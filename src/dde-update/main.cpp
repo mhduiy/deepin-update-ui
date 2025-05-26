@@ -84,7 +84,7 @@ int main(int argc, char *argv[])
     DGuiApplicationHelper::instance()->setApplicationPalette(pa);
 
     QTranslator translatorLanguage;
-    translatorLanguage.load("/usr/share/deepin-update-ui/translations/dde-update_" + getCurrentLocale());
+    (void)translatorLanguage.load("/usr/share/deepin-update-ui/translations/dde-update_" + getCurrentLocale());
     app->installTranslator(&translatorLanguage);
 
     UpdateWorker::instance()->init();

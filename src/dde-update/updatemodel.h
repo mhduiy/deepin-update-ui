@@ -102,7 +102,7 @@ public:
     bool whetherDoUpgrade() const { return m_doUpgrade; }
 
     void setUpdateMode(int updateMode) { m_updateMode = updateMode; }
-    int updateMode() const { return m_updateMode; }
+    int updateMode() const { return 5; }
 
     static QString updateActionText(UpdateAction action);
 

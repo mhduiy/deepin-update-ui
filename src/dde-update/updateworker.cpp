@@ -6,6 +6,7 @@
 #include "dconfig_helper.h"
 #include "common/dbus/updatejobdbusproxy.h"
 #include "common/commondefine.h"
+#include "updatemodel.h"
 
 #include <QTimer>
 #include <QDir>
@@ -22,6 +23,8 @@
 #include <QFile>
 
 #include <DDBusSender>
+
+Q_LOGGING_CATEGORY(DDE_UPDATE_WORKER, "dde-update-worker")
 
 static const QList<UpdateModel::UpdateError> CAN_BE_FIXED_ERRORS = { UpdateModel::DpkgInterrupted };
 
@@ -120,7 +123,7 @@ void UpdateWorker::doDistUpgrade(bool doBackup)
 {
     qInfo() << "Do dist upgrade, do backup: " << doBackup;
     if (!m_dbusProxy->managerInterIsValid()) {
-        UpdateModel::instance()->setLastErrorLog("com.deepin.lastore.Manager interface is invalid.");
+        UpdateModel::instance()->setLastErrorLog("org.deepin.dde.Lastore1.Manager interface is invalid.");
         UpdateModel::instance()->setUpdateError(UpdateModel::UpdateError::UpdateInterfaceError);
         UpdateModel::instance()->setUpdateStatus(UpdateModel::UpdateStatus::InstallFailed);
         return;
@@ -132,13 +135,21 @@ void UpdateWorker::doDistUpgrade(bool doBackup)
     }
 
     cleanLaStoreJob(m_distUpgradeJob);
+    cleanLaStoreJob(m_backupJob);
+    qWarning() << "===========" << UpdateModel::instance()->updateMode();
     QDBusPendingReply<QDBusObjectPath> reply = m_dbusProxy->DistUpgradePartly(UpdateModel::instance()->updateMode(), doBackup);
     QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(reply, this);
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, reply, watcher] {
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, reply, watcher, doBackup] {
         watcher->deleteLater();
         if (reply.isValid()) {
-            UpdateModel::instance()->setUpdateStatus(UpdateModel::UpdateStatus::Installing);
-            createDistUpgradeJob(reply.value().path());
+            if (doBackup) {
+                UpdateModel::instance()->setUpdateStatus(UpdateModel::UpdateStatus::BackingUp);
+                createBackupJob(reply.value().path());
+            } else {
+                UpdateModel::instance()->setUpdateStatus(UpdateModel::UpdateStatus::Installing);
+                createDistUpgradeJob(reply.value().path());
+            }
+            
         } else {
             const QString &errorMessage = watcher->error().message();
             qWarning() << "Do dist upgrade failed:" << watcher->error().message();
@@ -170,6 +181,9 @@ void UpdateWorker::onJobListChanged(const QList<QDBusObjectPath> &jobs)
         } else if (id == "check_system" && m_checkSystemJob == nullptr) {
             qInfo() << "Create check system job";
             createCheckSystemJob(jobPath);
+        } else if (id == "backup" && m_backupJob == nullptr) {
+            qInfo() << "Create backup job";
+            createBackupJob(jobPath);
         }
     }
 }
@@ -217,6 +231,26 @@ void UpdateWorker::createCheckSystemJob(const QString& jobPath)
     connect(m_checkSystemJob, &UpdateJobDBusProxy::StatusChanged, this, &UpdateWorker::onCheckSystemStatusChanged);
     UpdateModel::instance()->setJobProgress(m_checkSystemJob->progress());
     onCheckSystemStatusChanged(m_checkSystemJob->status());
+}
+
+void UpdateWorker::createBackupJob(const QString& jobPath)
+{
+    qCInfo(DDE_UPDATE_WORKER) << "Create backup upgrade job, path:" << jobPath;
+    if (m_backupJob || jobPath.isEmpty()) {
+        qCInfo(DDE_UPDATE_WORKER) << "Job is not null or job path is empty";
+        return;
+    }
+
+    m_backupJob = new UpdateJobDBusProxy(jobPath, this);
+    connect(m_backupJob, &UpdateJobDBusProxy::ProgressChanged, UpdateModel::instance(), &UpdateModel::setJobProgress);
+    connect(m_backupJob, &UpdateJobDBusProxy::StatusChanged, this, &UpdateWorker::onCheckSystemStatusChanged);
+    connect(m_backupJob, &UpdateJobDBusProxy::DescriptionChanged, this, [this](const QString &description) {
+        if (m_backupJob->status() == "failed") {
+            UpdateModel::instance()->setLastErrorLog(description);
+        }
+    });
+    UpdateModel::instance()->setJobProgress(m_backupJob->progress());
+    onBackupStatusChanged(m_backupJob->status());
 }
 
 void UpdateWorker::onDistUpgradeStatusChanged(const QString &status)
@@ -295,6 +329,19 @@ void UpdateWorker::onCheckSystemStatusChanged(const QString &status)
     }
 }
 
+void UpdateWorker::onBackupStatusChanged(const QString &value)
+{
+    qCInfo(DDE_UPDATE_WORKER) << "backup status changed: " << value;
+    if (value == "failed") {
+        const auto& description = m_backupJob->description();
+        // UpdateModel::instance()->setLastErrorLog(BackupFailed, description);
+        // UpdateModel::instance()->setLastError(BackupFailed, analyzeJobErrorMessage(description, BackupFailed));
+        // UpdateModel::instance()->setBackupFailedTips(m_model->errorToText(m_model->lastError(BackupFailed)));
+    } else if (value == "end") {
+        // deleteJob(m_downloadJob);
+    }
+}
+
 UpdateModel::UpdateError UpdateWorker::analyzeJobErrorMessage(QString jobDescription)
 {
     qInfo() << "Analyze job error message: " << jobDescription;
@@ -323,39 +370,19 @@ UpdateModel::UpdateError UpdateWorker::analyzeJobErrorMessage(QString jobDescrip
 
 void UpdateWorker::doDistUpgradeIfCanBackup()
 {
-#if 0 // TODO
+// TODO 进入更新的接口
     qInfo() << "Prepare to do backup";
-    QDBusPendingCall call = m_abRecoveryInter->CanBackup();
-    QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(call, this);
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, call] {
-        if (!call.isError()) {
-            QDBusReply<bool> reply = call.reply();
-            const bool value = reply.value();
-            if (value) {
-                m_abRecoveryInter->setSync(true);
-                const bool hasBackedUp = m_abRecoveryInter->hasBackedUp();
-                m_abRecoveryInter->setSync(false);
-                qInfo() << "Has backed up:" << hasBackedUp;
-                if (hasBackedUp) {
-                    UpdateModel::instance()->setUpdateStatus(UpdateModel::BackupSuccess);
-                } else {
-                    UpdateModel::instance()->setUpdateStatus(UpdateModel::BackingUp);
-                }
-                doDistUpgrade(true);
-            } else {
-                qWarning() << "Can not backup";
-                UpdateModel::instance()->setLastErrorLog(reply.error().message());
-                UpdateModel::instance()->setUpdateError(UpdateModel::CanNotBackup);
-                UpdateModel::instance()->setUpdateStatus(UpdateModel::BackupFailed);
-            }
-        } else {
-            qWarning() << "Call `CanBackup` failed";
-            UpdateModel::instance()->setLastErrorLog("Call `CanBackup` method in dbus interface - com.deepin.ABRecovery failed");
-            UpdateModel::instance()->setUpdateError(UpdateModel::UpdateInterfaceError);
-            UpdateModel::instance()->setUpdateStatus(UpdateModel::UpdateStatus::BackupFailed);
-        }
-    });
-#endif
+    // 当前没有检查是否能够备份，默认能够备份，之后再支持
+    bool canBackup = true;
+    
+    if (canBackup) {
+        doDistUpgrade(true);
+    } else {
+        qWarning() << "Can not backup";
+        // UpdateModel::instance()->setLastErrorLog(reply.error().message());
+        UpdateModel::instance()->setUpdateError(UpdateModel::CanNotBackup);
+        UpdateModel::instance()->setUpdateStatus(UpdateModel::BackupFailed);
+    }
 }
 
 void UpdateWorker::doCheckSystem(int updateMode, UpdateModel::CheckSystemStage stage)
@@ -487,6 +514,7 @@ bool UpdateWorker::fixError(UpdateModel::UpdateError error, const QString &descr
 void UpdateWorker::doPowerAction(bool reboot)
 {
     qInfo() << "Update worker do power action, is reboot: " << reboot;
+    return;
 
     auto powerActionReply = m_dbusProxy->Poweroff(reboot);
     powerActionReply.waitForFinished();
@@ -628,6 +656,7 @@ void UpdateWorker::getUpdateOption()
 void UpdateWorker::forceReboot(bool reboot)
 {
     qInfo() << "Force reboot:" << reboot;
+    return;
     QDBusPendingReply<void> reply = m_dbusProxy->Poweroff(reboot);
     QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(reply, this);
     connect(watcher, &QDBusPendingCallWatcher::finished, this, [reply, watcher] {
